@@ -21,8 +21,9 @@
  * - `/review --extra "focus on performance regressions"` - add extra review instruction (works with any mode)
  *
  * Project-specific review guidelines:
- * - If a REVIEW_GUIDELINES.md file exists in the same directory as .pi,
- *   its contents are appended to the review prompt.
+ * - Walks up from the cwd to the repo root collecting REVIEW_GUIDELINES.md,
+ *   CODING_STANDARDS.md, CONTRIBUTING.md and AGENTS.md, and appends them to the
+ *   review prompt as standards that override the built-in rubric.
  *
  * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
  */
@@ -275,34 +276,56 @@ Provide your findings in a clear, structured format:
 
 Output all findings the author would fix if they knew about them. If there are no qualifying findings, explicitly state the code looks good. Don't stop at the first finding - list every qualifying issue. Then append the required non-blocking callouts section.`;
 
+// Files that document how code should be written in this repo, in priority order.
+// The first one found in a directory wins for that filename; all matches are concatenated.
+const GUIDELINE_FILENAMES = [
+	"REVIEW_GUIDELINES.md",
+	"CODING_STANDARDS.md",
+	"CONTRIBUTING.md",
+	"AGENTS.md",
+] as const;
+
+// Guard against a single sprawling CONTRIBUTING.md crowding out the diff.
+const GUIDELINE_MAX_CHARS = 12_000;
+
+/**
+ * Walk up from `cwd` collecting standards documents, stopping after the repo root
+ * (the first directory containing `.git` or `.pi`).
+ */
 async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> {
+	const sections: string[] = [];
+	const seenNames = new Set<string>();
 	let currentDir = path.resolve(cwd);
 
 	while (true) {
-		const piDir = path.join(currentDir, ".pi");
-		const guidelinesPath = path.join(currentDir, "REVIEW_GUIDELINES.md");
+		for (const name of GUIDELINE_FILENAMES) {
+			if (seenNames.has(name)) continue;
 
-		const piStats = await fs.stat(piDir).catch(() => null);
-		if (piStats?.isDirectory()) {
-			const guidelineStats = await fs.stat(guidelinesPath).catch(() => null);
-			if (guidelineStats?.isFile()) {
-				try {
-					const content = await fs.readFile(guidelinesPath, "utf8");
-					const trimmed = content.trim();
-					return trimmed ? trimmed : null;
-				} catch {
-					return null;
-				}
-			}
-			return null;
+			const filePath = path.join(currentDir, name);
+			const stats = await fs.stat(filePath).catch(() => null);
+			if (!stats?.isFile()) continue;
+
+			seenNames.add(name);
+			const content = (await fs.readFile(filePath, "utf8")).trim();
+			if (!content) continue;
+
+			const body =
+				content.length > GUIDELINE_MAX_CHARS
+					? `${content.slice(0, GUIDELINE_MAX_CHARS)}\n\n[truncated - read ${filePath} directly for the rest]`
+					: content;
+			sections.push(`### ${filePath}\n\n${body}`);
 		}
+
+		const isRepoRoot =
+			(await fs.stat(path.join(currentDir, ".git")).catch(() => null)) !== null ||
+			(await fs.stat(path.join(currentDir, ".pi")).catch(() => null))?.isDirectory() === true;
 
 		const parentDir = path.dirname(currentDir);
-		if (parentDir === currentDir) {
-			return null;
-		}
+		if (isRepoRoot || parentDir === currentDir) break;
 		currentDir = parentDir;
 	}
+
+	return sections.length > 0 ? sections.join("\n\n") : null;
 }
 
 /**
@@ -1162,7 +1185,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		}
 
 		if (projectGuidelines) {
-			fullPrompt += `\n\nThis project has additional instructions for code reviews:\n\n${projectGuidelines}`;
+			fullPrompt += `\n\nThis project documents its own standards. These override the general guidelines above wherever they conflict:\n\n${projectGuidelines}`;
 		}
 
 		const modeHint = useFreshSession ? " (fresh session)" : "";
