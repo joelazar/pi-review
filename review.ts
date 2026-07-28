@@ -25,6 +25,12 @@
  *   CODING_STANDARDS.md, CONTRIBUTING.md and AGENTS.md, and appends them to the
  *   review prompt as standards that override the built-in rubric.
  *
+ * Spec axis:
+ * - Linear (ENG-123) and GitHub (#123) issue references in the branch name and
+ *   commit messages are fetched via `linear issue describe` / `gh issue view`,
+ *   plus the PR description in PR mode. The review then reports a separate Spec
+ *   section covering missing requirements, scope creep and wrong implementations.
+ *
  * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
  */
 
@@ -277,6 +283,18 @@ Rules for this section:
 5. Keep each emitted callout bold exactly as written.
 6. If none apply, write "- (none)".
 
+## Spec conformance (second axis)
+
+If a spec is supplied below (Linear issue, GitHub issue, PR description, or a spec file), review the change on a **second, separate axis**: does the diff faithfully implement what the spec asked for?
+
+Report spec findings under their own \`## Spec\` heading, kept separate from the defect findings. Do not merge or rerank across the two axes - a change can follow every guideline while implementing the wrong thing, and vice versa. For each spec finding, quote the spec line it comes from and cover:
+
+1. Requirements the spec asked for that are **missing or partial**.
+2. Behaviour in the diff that **wasn't asked for** (scope creep).
+3. Requirements that look implemented but where the **implementation looks wrong**.
+
+If no spec was supplied, write "## Spec\n\n- (no spec available)" and move on. Never invent a spec from the diff.
+
 ## Priority levels
 
 Tag each finding with a priority level in the title:
@@ -287,14 +305,15 @@ Tag each finding with a priority level in the title:
 
 ## Output format
 
-Provide your findings in a clear, structured format:
+Provide your findings in a clear, structured format, in this section order: \`## Findings\`, \`## Spec\`, verdict, \`## Human Reviewer Callouts (Non-Blocking)\`.
 1. List each finding with its priority tag, file location, and explanation.
 2. Findings must reference locations that overlap with the actual diff — don't flag pre-existing code.
 3. Keep line references as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).
 4. Provide an overall verdict: "correct" (no blocking issues) or "needs attention" (has blocking issues).
 5. Ignore trivial style issues unless they obscure meaning or violate documented standards.
 6. Do not generate a full PR fix — only flag issues and optionally provide short suggestion blocks.
-7. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
+7. Give the verdict per axis when a spec was supplied (defects: correct / needs attention; spec: conformant / diverges), and don't pick a single winner across axes.
+8. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
 
 Output all findings the author would fix if they knew about them. If there are no qualifying findings, explicitly state the code looks good. Don't stop at the first finding - list every qualifying issue. Then append the required non-blocking callouts section.`;
 
@@ -589,6 +608,148 @@ async function validateReviewTarget(pi: ExtensionAPI, target: ReviewTarget, cwd:
 			return { ok: true };
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec discovery (second review axis)
+// ---------------------------------------------------------------------------
+
+type SpecSource = { origin: string; content: string };
+
+// Linear issue identifiers, e.g. ENG-1234.
+const LINEAR_ISSUE_PATTERN = /\b([A-Z][A-Z0-9]{1,9})-(\d+)\b/g;
+
+// Standards and encodings that look exactly like Linear keys (SHA-1, UTF-8, RFC-2119).
+const LINEAR_PREFIX_BLOCKLIST = new Set([
+	"SHA",
+	"MD",
+	"UTF",
+	"ISO",
+	"RFC",
+	"AES",
+	"RSA",
+	"IPV",
+	"HTTP",
+	"ES",
+	"CVE",
+	"BASE",
+	"X",
+]);
+const GITHUB_ISSUE_PATTERN = /(?:^|[\s(\[])#(\d+)\b/g;
+const MAX_SPEC_SOURCES = 3;
+const SPEC_MAX_CHARS = 8_000;
+
+function truncateSpec(content: string): string {
+	const trimmed = content.trim();
+	return trimmed.length > SPEC_MAX_CHARS ? `${trimmed.slice(0, SPEC_MAX_CHARS)}\n\n[truncated]` : trimmed;
+}
+
+/**
+ * Commit subjects and bodies for the range, used to sniff out issue references.
+ */
+async function getCommitMessages(pi: ExtensionAPI, range: string): Promise<string> {
+	const { stdout, code } = await pi.exec("git", ["log", "--format=%s%n%b", range]);
+	return code === 0 ? stdout : "";
+}
+
+async function fetchLinearIssue(pi: ExtensionAPI, id: string): Promise<SpecSource | null> {
+	const { stdout, code } = await pi.exec("linear", ["issue", "describe", id]);
+	if (code !== 0 || !stdout.trim()) return null;
+	return { origin: `Linear issue ${id}`, content: truncateSpec(stdout) };
+}
+
+async function fetchGithubIssue(pi: ExtensionAPI, issueNumber: number): Promise<SpecSource | null> {
+	const { stdout, code } = await pi.exec("gh", ["issue", "view", String(issueNumber), "--json", "title,body"]);
+	if (code !== 0 || !stdout.trim()) return null;
+
+	const data = JSON.parse(stdout) as { title?: string; body?: string };
+	const content = `# ${data.title ?? `Issue #${issueNumber}`}\n\n${data.body ?? ""}`;
+	if (!data.body?.trim()) return null;
+	return { origin: `GitHub issue #${issueNumber}`, content: truncateSpec(content) };
+}
+
+async function fetchPrDescription(pi: ExtensionAPI, prNumber: number): Promise<SpecSource | null> {
+	const { stdout, code } = await pi.exec("gh", ["pr", "view", String(prNumber), "--json", "title,body"]);
+	if (code !== 0 || !stdout.trim()) return null;
+
+	const data = JSON.parse(stdout) as { title?: string; body?: string };
+	if (!data.body?.trim()) return null;
+	return {
+		origin: `PR #${prNumber} description`,
+		content: truncateSpec(`# ${data.title ?? `PR #${prNumber}`}\n\n${data.body}`),
+	};
+}
+
+/**
+ * The text to scan for issue references: the branch name plus commit messages
+ * in the reviewed range.
+ */
+async function getSpecScanText(pi: ExtensionAPI, target: ReviewTarget): Promise<string> {
+	const branch = (await getCurrentBranch(pi)) ?? "";
+
+	switch (target.type) {
+		case "commit":
+			return `${branch}\n${await getCommitMessages(pi, `${target.sha}^..${target.sha}`)}`;
+
+		case "baseBranch":
+		case "pullRequest": {
+			const base = target.type === "baseBranch" ? target.branch : target.baseBranch;
+			const mergeBase = await getMergeBase(pi, base);
+			const messages = mergeBase ? await getCommitMessages(pi, `${mergeBase}..HEAD`) : "";
+			return `${branch}\n${messages}`;
+		}
+
+		case "uncommitted":
+		case "folder":
+			return branch;
+	}
+}
+
+/**
+ * Find the originating spec for the change: Linear issues referenced by the branch
+ * or commits, GitHub issues, and the PR description. Returns an empty list when
+ * nothing is found — the review then runs on the defect axis alone.
+ */
+async function collectSpecSources(pi: ExtensionAPI, target: ReviewTarget): Promise<SpecSource[]> {
+	const sources: SpecSource[] = [];
+
+	if (target.type === "pullRequest") {
+		const prSpec = await fetchPrDescription(pi, target.prNumber);
+		if (prSpec) sources.push(prSpec);
+	}
+
+	const scanText = await getSpecScanText(pi, target);
+
+	const linearIds = [
+		...new Set(
+			Array.from(scanText.matchAll(LINEAR_ISSUE_PATTERN))
+				.filter((m) => !LINEAR_PREFIX_BLOCKLIST.has(m[1]))
+				.map((m) => `${m[1]}-${m[2]}`),
+		),
+	];
+	if (linearIds.length > 0 && (await pi.exec("linear", ["--version"])).code === 0) {
+		for (const id of linearIds) {
+			if (sources.length >= MAX_SPEC_SOURCES) break;
+			const spec = await fetchLinearIssue(pi, id);
+			if (spec) sources.push(spec);
+		}
+	}
+
+	const githubIssues = [...new Set(Array.from(scanText.matchAll(GITHUB_ISSUE_PATTERN), (m) => Number(m[1])))];
+	if (githubIssues.length > 0 && (await pi.exec("gh", ["--version"])).code === 0) {
+		for (const issueNumber of githubIssues) {
+			if (sources.length >= MAX_SPEC_SOURCES) break;
+			const spec = await fetchGithubIssue(pi, issueNumber);
+			if (spec) sources.push(spec);
+		}
+	}
+
+	return sources;
+}
+
+function formatSpecSection(sources: SpecSource[]): string {
+	const blocks = sources.map((s) => `### ${s.origin}\n\n${s.content}`).join("\n\n");
+	return `Originating spec for this change (review the diff against it on the Spec axis):\n\n${blocks}`;
 }
 
 /**
@@ -1211,6 +1372,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return false;
 		}
 
+		const specSources = await collectSpecSources(pi, target);
+
 		// Handle fresh session mode
 		if (useFreshSession) {
 			// Store current position (where we'll return to).
@@ -1285,8 +1448,15 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			fullPrompt += `\n\nThis project documents its own standards. These override the general guidelines above wherever they conflict:\n\n${projectGuidelines}`;
 		}
 
+		if (specSources.length > 0) {
+			fullPrompt += `\n\n${formatSpecSection(specSources)}`;
+		} else {
+			fullPrompt += "\n\nNo originating spec was found for this change. Report \"(no spec available)\" under the Spec heading and do not infer one from the diff.";
+		}
+
 		const modeHint = useFreshSession ? " (fresh session)" : "";
-		ctx.ui.notify(`Starting review: ${hint}${modeHint}`, "info");
+		const specHint = specSources.length > 0 ? ` — spec: ${specSources.map((s) => s.origin).join(", ")}` : "";
+		ctx.ui.notify(`Starting review: ${hint}${modeHint}${specHint}`, "info");
 
 		// Send as a user message that triggers a turn
 		pi.sendUserMessage(fullPrompt);
