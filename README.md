@@ -18,8 +18,33 @@ pi install git:github.com/earendil-works/pi-review
 - Review one or more **folders/files** as a snapshot (not a diff)
 - Produce prioritized findings with a clear verdict and actionable follow-ups
 - It separates feedback to the agent from human callouts
+- Review on a second **spec axis**: does the change do what the ticket asked for?
 
-It also supports custom shared instructions that are loaded from `REVIEW_GUIDELINES.md`.
+## Two axes
+
+Findings are reported under two headings that are deliberately kept separate, since one
+can pass while the other fails:
+
+- **Findings** — defects, security, fail-fast error handling, clean code, and a baseline of
+  Fowler design smells (Feature Envy, Data Clumps, Speculative Generality, …) tagged as
+  judgement calls.
+- **Spec** — missing or partial requirements, scope creep, and requirements implemented
+  incorrectly, each quoting the spec line it came from.
+
+The spec is discovered automatically from Linear issue keys (`ENG-123`) and GitHub issue
+refs (`#123`) in the branch name and commit messages, plus the PR description in PR mode.
+Linear issues are fetched with `linear issue describe`, GitHub issues with `gh issue view`.
+If nothing is found the Spec section reports `(no spec available)` rather than inventing one.
+
+## Project standards
+
+Walking up from the working directory to the repo root, these files are picked up and
+appended to the prompt as standards that override the built-in rubric:
+
+`REVIEW_GUIDELINES.md`, `CODING_STANDARDS.md`, `CONTRIBUTING.md`, `AGENTS.md`
+
+The review target is also validated up front (ref resolves, diff is non-empty, paths exist),
+so a typo fails immediately instead of halfway through a turn.
 
 ## Quick usage
 
