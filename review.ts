@@ -524,6 +524,73 @@ async function getDefaultBranch(pi: ExtensionAPI): Promise<string> {
 	return "main"; // Default fallback
 }
 
+// ---------------------------------------------------------------------------
+// Target validation
+// ---------------------------------------------------------------------------
+
+type TargetValidation = { ok: true } | { ok: false; message: string };
+
+/**
+ * Resolve the diff base for a target, or explain why it can't be resolved.
+ * Runs before the prompt is sent so a bad ref or empty diff fails here rather
+ * than halfway through a model turn.
+ */
+async function validateReviewTarget(pi: ExtensionAPI, target: ReviewTarget, cwd: string): Promise<TargetValidation> {
+	switch (target.type) {
+		case "uncommitted": {
+			if (!(await hasUncommittedChanges(pi))) {
+				return { ok: false, message: "No uncommitted changes to review (working tree is clean)." };
+			}
+			return { ok: true };
+		}
+
+		case "commit": {
+			const { code } = await pi.exec("git", ["rev-parse", "--verify", "--quiet", `${target.sha}^{commit}`]);
+			if (code !== 0) {
+				return { ok: false, message: `Not a valid commit: ${target.sha}` };
+			}
+
+			const { stdout } = await pi.exec("git", ["show", "--stat", "--format=", target.sha]);
+			if (!stdout.trim()) {
+				return { ok: false, message: `Commit ${target.sha.slice(0, 7)} has no file changes to review.` };
+			}
+			return { ok: true };
+		}
+
+		case "baseBranch":
+		case "pullRequest": {
+			const branch = target.type === "baseBranch" ? target.branch : target.baseBranch;
+			const { code } = await pi.exec("git", ["rev-parse", "--verify", "--quiet", `${branch}^{commit}`]);
+			if (code !== 0) {
+				return { ok: false, message: `Base branch does not resolve: ${branch}` };
+			}
+
+			const mergeBase = await getMergeBase(pi, branch);
+			if (!mergeBase) {
+				return { ok: false, message: `No merge base between HEAD and ${branch} (unrelated histories?).` };
+			}
+
+			const { stdout } = await pi.exec("git", ["diff", "--stat", mergeBase]);
+			if (!stdout.trim()) {
+				return { ok: false, message: `No changes between HEAD and ${branch} — nothing to review.` };
+			}
+			return { ok: true };
+		}
+
+		case "folder": {
+			const missing: string[] = [];
+			for (const p of target.paths) {
+				const stats = await fs.stat(path.resolve(cwd, p)).catch(() => null);
+				if (!stats) missing.push(p);
+			}
+			if (missing.length > 0) {
+				return { ok: false, message: `Path(s) not found: ${missing.join(", ")}` };
+			}
+			return { ok: true };
+		}
+	}
+}
+
 /**
  * Build the review prompt based on target
  */
@@ -1133,6 +1200,14 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		// Check if we're already in a review
 		if (reviewOriginId) {
 			ctx.ui.notify("Already in a review. Use /end-review to finish first.", "warning");
+			return false;
+		}
+
+		// Resolve the target before branching the session, so a bad ref or empty diff
+		// fails here instead of inside the model turn.
+		const validation = await validateReviewTarget(pi, target, ctx.cwd);
+		if (!validation.ok) {
+			ctx.ui.notify(validation.message, "error");
 			return false;
 		}
 
