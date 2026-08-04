@@ -230,9 +230,9 @@ Each smell reads *what it is* -> *how to fix*; match it against the diff:
 
 1. Be clear about why the issue is a problem.
 2. Communicate severity appropriately - don't exaggerate.
-3. Be brief - at most 1 paragraph.
-4. Keep code snippets under 3 lines, wrapped in inline code or code blocks.
-5. Use \`\`\`suggestion blocks ONLY for concrete replacement code (minimal lines; no commentary inside the block). Preserve the exact leading whitespace of the replaced lines.
+3. Be brief - the prose around each finding is at most one short paragraph; let the code carry the rest.
+4. Show, don't just tell: quote the offending code and show the fix as code. Keep each block to the smallest span that makes the point (usually under 10 lines), never a whole function unless the whole function is the problem.
+5. The **Fix** block holds ONLY concrete replacement code (no commentary inside the block). Preserve the exact leading whitespace of the replaced lines.
 6. Explicitly state scenarios/environments where the issue arises.
 7. Use a matter-of-fact tone - helpful AI assistant, not accusatory.
 8. Write for quick comprehension without close reading.
@@ -303,15 +303,47 @@ Tag each finding with a priority level in the title:
 - [P2] - Normal. To be fixed eventually.
 - [P3] - Low. Nice to have.
 
+## Finding format (mandatory)
+
+Every finding — on both the defect axis and the Spec axis — is a level-3 heading followed by a fixed set of labelled parts:
+
+\`\`\`
+### [P1] Short imperative title — \`path/to/file.ts:42\`
+
+**Problem:** one or two sentences on what breaks and when.
+
+**Current:**
+\`\`\`ts
+// the smallest span of the reviewed code that shows the defect
+\`\`\`
+
+**Fix:**
+\`\`\`ts
+// concrete replacement code, same indentation as the lines it replaces
+\`\`\`
+
+**Impact:** why it matters (correctness / security / performance / maintainability) and in which scenario.
+\`\`\`
+
+Rules:
+1. The heading must start with the priority tag and end with a \`path:line\` location in backticks.
+2. **Current** and **Fix** are required whenever the finding is about concrete code. Copy the current code verbatim from the file — do not paraphrase it.
+3. Copy code with the file's own indentation and nothing else. Never carry over diff markers (\`+\`/\`-\`), line numbers, or the extra gutter spaces from \`git diff\` output.
+4. Omit the **Fix** block only when no code fix exists (e.g. a missing-requirement spec finding); then add **Fix:** as a one-line prose instruction instead.
+5. Never emit an empty **Fix** block. When the fix is a deletion, write \`**Fix:** delete <what>\` as prose, or show the surrounding lines as they read after the deletion.
+6. Tag both blocks with the real language of the file (\`ts\`, \`go\`, \`sql\`, ...). Never use \`suggestion\` or any other pseudo-language as the tag.
+7. Never merge two issues into one finding — one heading per issue.
+8. State what you actually checked when a claim depends on it ("go-utils Sink docs say ...", "no caller reads env.SD.Audit"). Don't assert behaviour of code you didn't read.
+
 ## Output format
 
 Provide your findings in a clear, structured format, in this section order: \`## Findings\`, \`## Spec\`, verdict, \`## Human Reviewer Callouts (Non-Blocking)\`.
-1. List each finding with its priority tag, file location, and explanation.
+1. Every finding follows the mandatory finding format above.
 2. Findings must reference locations that overlap with the actual diff — don't flag pre-existing code.
 3. Keep line references as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).
 4. Provide an overall verdict: "correct" (no blocking issues) or "needs attention" (has blocking issues).
 5. Ignore trivial style issues unless they obscure meaning or violate documented standards.
-6. Do not generate a full PR fix — only flag issues and optionally provide short suggestion blocks.
+6. Do not generate a full PR fix — the **Fix** blocks stay scoped to the flagged lines.
 7. Give the verdict per axis when a spec was supplied (defects: correct / needs attention; spec: conformant / diverges), and don't pick a single winner across axes.
 8. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
 
@@ -1699,11 +1731,25 @@ Required sections (in order):
 - "correct" or "needs attention"
 
 ## Findings
-For EACH finding, include:
-- Priority tag ([P0]..[P3]) and short title
-- File location (\`path/to/file.ext:line\`)
-- Why it matters (brief)
-- What should change (brief, actionable)
+Reproduce each finding in the same shape the review used:
+
+### [P1] Short title — \`path/to/file.ext:line\`
+
+**Problem:** brief
+
+**Current:**
+\`\`\`lang
+code as reviewed
+\`\`\`
+
+**Fix:**
+\`\`\`lang
+replacement code
+\`\`\`
+
+**Impact:** brief
+
+Keep the code blocks verbatim from the review; do not drop them.
 
 ## Fix Queue
 1. Ordered implementation checklist (highest priority first)
