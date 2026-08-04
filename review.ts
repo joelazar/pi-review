@@ -35,15 +35,20 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, BorderedLoader } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, BorderedLoader, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	fuzzyFilter,
 	Input,
+	Key,
+	Markdown,
+	matchesKey,
 	type SelectItem,
 	SelectList,
 	Spacer,
 	Text,
+	truncateToWidth,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
 import path from "node:path";
 import { promises as fs } from "node:fs";
@@ -863,6 +868,228 @@ const REVIEW_PRESETS = [
 	{ value: "pullRequest", label: "Review a pull request", description: "(GitHub PR)" },
 	{ value: "folder", label: "Review a folder (or more)", description: "(snapshot, not diff)" },
 ] as const;
+
+// ---------------------------------------------------------------------------
+// Finding extraction (drives the /end-review picker)
+// ---------------------------------------------------------------------------
+
+type ReviewAxis = "Findings" | "Spec";
+
+type ReviewFinding = {
+	axis: ReviewAxis;
+	priority: string;
+	title: string;
+	location?: string;
+	body: string;
+};
+
+const AXIS_HEADING = /^##\s+(findings|spec)\b/i;
+const FINDING_HEADING = /^#{3,6}\s+(.*\[P[0-3]\].*)$/;
+const PRIORITY_TAG = /\[P[0-3]\]/;
+const BACKTICKED = /`([^`]+)`/g;
+// path/to/file.ext:12 — with or without backticks, since models drop them.
+const BARE_LOCATION = /(?:^|[\s(\[`\u2014-])([\w./@-]+\.[A-Za-z][\w]*(?::\d+(?:-\d+)?)?)/g;
+
+/**
+ * The last assistant message in the branch that produced a review report.
+ */
+function findReviewReport(ctx: ExtensionContext): string | undefined {
+	let report: string | undefined;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		const text = entry.message.content
+			.filter((block): block is { type: "text"; text: string } => block.type === "text")
+			.map((block) => block.text)
+			.join("\n");
+		if (text.split("\n").some((line) => AXIS_HEADING.test(line))) {
+			report = text;
+		}
+	}
+	return report;
+}
+
+function parseFindingHeading(heading: string): { priority: string; title: string; location?: string } {
+	const priority = heading.match(PRIORITY_TAG)?.[0] ?? "[P2]";
+	const candidates = [
+		...Array.from(heading.matchAll(BACKTICKED), (m) => m[1]),
+		...Array.from(heading.matchAll(BARE_LOCATION), (m) => m[1]),
+	];
+	const location = candidates.find((value) => /:\d+/.test(value));
+	const title = (location ? heading.replace(location, "") : heading)
+		.replace(PRIORITY_TAG, "")
+		.replaceAll("`", "")
+		.replace(/[\s\u2014\-:|(),]+$/, "")
+		.trim();
+	return { priority, title: title || "(untitled finding)", location };
+}
+
+/**
+ * Split a review report into individual findings, keyed by the axis heading they
+ * live under. Findings are the level-3+ headings carrying a priority tag.
+ */
+function parseReviewFindings(report: string): ReviewFinding[] {
+	const findings: ReviewFinding[] = [];
+	let axis: ReviewAxis | null = null;
+	let current: ReviewFinding | null = null;
+	let body: string[] = [];
+	let inFence = false;
+
+	const flush = () => {
+		if (current) findings.push({ ...current, body: body.join("\n").trim() });
+		current = null;
+		body = [];
+	};
+
+	for (const line of report.split("\n")) {
+		if (/^\s*```/.test(line)) inFence = !inFence;
+
+		if (!inFence) {
+			const axisMatch = line.match(AXIS_HEADING);
+			if (axisMatch) {
+				flush();
+				axis = axisMatch[1].toLowerCase() === "spec" ? "Spec" : "Findings";
+				continue;
+			}
+			if (/^##\s+/.test(line)) {
+				flush();
+				axis = null;
+				continue;
+			}
+
+			const findingMatch = axis ? line.match(FINDING_HEADING) : null;
+			if (findingMatch && axis) {
+				flush();
+				current = { axis, ...parseFindingHeading(findingMatch[1]), body: "" };
+				continue;
+			}
+		}
+
+		if (current) body.push(line);
+	}
+
+	flush();
+	return findings;
+}
+
+function formatFindingMarkdown(finding: ReviewFinding): string {
+	const location = finding.location ? ` \u2014 \`${finding.location}\`` : "";
+	return `### ${finding.priority} ${finding.title}${location}\n\n${finding.body}`;
+}
+
+function priorityColor(priority: string): "error" | "warning" | "text" | "dim" {
+	switch (priority) {
+		case "[P0]":
+			return "error";
+		case "[P1]":
+			return "warning";
+		case "[P3]":
+			return "dim";
+		default:
+			return "text";
+	}
+}
+
+const PICKER_MIN_ROWS = 8;
+const PICKER_LIST_MAX_WIDTH = 52;
+
+/** Half the terminal, so the detail pane has room to breathe. */
+function pickerRows(): number {
+	return Math.max(PICKER_MIN_ROWS, Math.floor((process.stdout.rows ?? 24) / 2));
+}
+
+/**
+ * Checkbox list of findings with a detail pane for the highlighted one.
+ * Returns the selected findings, or null when cancelled.
+ */
+async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding[]): Promise<ReviewFinding[] | null> {
+	return ctx.ui.custom<ReviewFinding[] | null>((tui, theme, _kb, done) => {
+		const checked = findings.map(() => true);
+		const mdTheme = getMarkdownTheme();
+		let cursor = 0;
+		let listOffset = 0;
+		let detailOffset = 0;
+		let detail: Markdown | null = null;
+		let detailFor = -1;
+		let rows = pickerRows();
+
+		const detailLines = (width: number): string[] => {
+			if (detailFor !== cursor || !detail) {
+				detail = new Markdown(formatFindingMarkdown(findings[cursor]), 0, 0, mdTheme);
+				detailFor = cursor;
+			}
+			return detail.render(width);
+		};
+
+		const moveCursor = (delta: number) => {
+			cursor = Math.min(findings.length - 1, Math.max(0, cursor + delta));
+			if (cursor < listOffset) listOffset = cursor;
+			if (cursor >= listOffset + rows) listOffset = cursor - rows + 1;
+			detailOffset = 0;
+		};
+
+		return {
+			render(width: number): string[] {
+				rows = pickerRows();
+				const listWidth = Math.min(PICKER_LIST_MAX_WIDTH, Math.max(20, Math.floor(width * 0.35)));
+				const paneWidth = Math.max(20, width - listWidth - 3);
+
+				const selectedCount = checked.filter(Boolean).length;
+				const header = theme.fg(
+					"accent",
+					theme.bold(`Select findings to fix (${selectedCount}/${findings.length})`),
+				);
+
+				const listRows: string[] = [];
+				const visible = findings.slice(listOffset, listOffset + rows);
+				visible.forEach((finding, index) => {
+					const absolute = listOffset + index;
+					const box = checked[absolute] ? "[x]" : "[ ]";
+					const axisTag = finding.axis === "Spec" ? "spec " : "";
+					const label = `${box} ${theme.fg(priorityColor(finding.priority), finding.priority)} ${axisTag}${finding.title}`;
+					const prefix = absolute === cursor ? theme.fg("accent", "\u276f ") : "  ";
+					listRows.push(truncateToWidth(`${prefix}${label}`, listWidth, "\u2026"));
+				});
+
+				const pane = detailLines(paneWidth);
+				detailOffset = Math.min(detailOffset, Math.max(0, pane.length - rows));
+				const paneWindow = pane.slice(detailOffset, detailOffset + rows);
+
+				const height = Math.max(listRows.length, paneWindow.length);
+				const separator = theme.fg("borderMuted", "\u2502");
+				const body: string[] = [];
+				for (let i = 0; i < height; i++) {
+					const left = listRows[i] ?? "";
+					const padding = " ".repeat(Math.max(0, listWidth - visibleWidth(left)));
+					body.push(`${left}${padding} ${separator} ${paneWindow[i] ?? ""}`);
+				}
+
+				const scrollHint = pane.length > rows ? " \u2022 \u2190\u2192 scroll detail" : "";
+				const footer = theme.fg(
+					"dim",
+					`j/k move \u2022 space toggle \u2022 a all \u2022 n none${scrollHint} \u2022 enter confirm \u2022 esc cancel`,
+				);
+
+				return [header, "", ...body, "", footer];
+			},
+			invalidate() {
+				detail = null;
+				detailFor = -1;
+			},
+			handleInput(data: string) {
+				if (data === "k" || matchesKey(data, Key.up)) moveCursor(-1);
+				else if (data === "j" || matchesKey(data, Key.down)) moveCursor(1);
+				else if (matchesKey(data, Key.left)) detailOffset = Math.max(0, detailOffset - Math.floor(rows / 2));
+				else if (matchesKey(data, Key.right)) detailOffset += Math.floor(rows / 2);
+				else if (matchesKey(data, Key.space)) checked[cursor] = !checked[cursor];
+				else if (data === "a") checked.fill(true);
+				else if (data === "n") checked.fill(false);
+				else if (matchesKey(data, Key.escape)) done(null);
+				else if (matchesKey(data, Key.enter)) done(findings.filter((_, index) => checked[index]));
+				tui.requestRender();
+			},
+		};
+	});
+}
 
 const TOGGLE_CUSTOM_INSTRUCTIONS_VALUE = "toggleCustomInstructions" as const;
 type ReviewPresetValue =
@@ -1786,6 +2013,29 @@ Instructions:
 8. Run relevant tests/checks for touched code where practical.
 9. End with: fixed items, deferred/skipped items (with reasons), and verification results.`;
 
+	function buildSelectedFindingsPrompt(findings: ReviewFinding[]): string {
+		const blocks = findings.map((finding) => formatFindingMarkdown(finding)).join("\n\n");
+		return `${REVIEW_FIX_FINDINGS_PROMPT}\n\nFix ONLY the findings selected below. Ignore every other finding from the review, even if the summary lists it.\n\n${blocks}`;
+	}
+
+	/**
+	 * Let the user pick which findings to act on. Runs before navigation, while the
+	 * review report is still on the branch.
+	 */
+	async function selectFindingsToFix(ctx: ExtensionCommandContext): Promise<ReviewFinding[] | null | "all"> {
+		const report = findReviewReport(ctx);
+		const findings = report ? parseReviewFindings(report) : [];
+		if (findings.length === 0) return "all";
+
+		const selected = await showFindingsPicker(ctx, findings);
+		if (selected === null) return null;
+		if (selected.length === 0) {
+			ctx.ui.notify("No findings selected.", "info");
+			return null;
+		}
+		return selected;
+	}
+
 	type EndReviewAction = "returnOnly" | "returnAndFix" | "returnAndSummarize";
 	type EndReviewActionResult = "ok" | "cancelled" | "error";
 	type EndReviewActionOptions = {
@@ -1856,6 +2106,7 @@ Instructions:
 		ctx: ExtensionCommandContext,
 		action: EndReviewAction,
 		options: EndReviewActionOptions = {},
+		selectedFindings?: ReviewFinding[],
 	): Promise<EndReviewActionResult> {
 		const originId = getActiveReviewOrigin(ctx);
 		if (!originId) {
@@ -1914,7 +2165,10 @@ Instructions:
 			return "ok";
 		}
 
-		pi.sendUserMessage(REVIEW_FIX_FINDINGS_PROMPT, { deliverAs: "followUp" });
+		const fixPrompt = selectedFindings?.length
+			? buildSelectedFindingsPrompt(selectedFindings)
+			: REVIEW_FIX_FINDINGS_PROMPT;
+		pi.sendUserMessage(fixPrompt, { deliverAs: "followUp" });
 		if (notifySuccess) {
 			ctx.ui.notify("Review complete! Returned and queued a follow-up to fix findings.", "info");
 		}
@@ -1953,10 +2207,22 @@ Instructions:
 						? "returnAndSummarize"
 						: "returnOnly";
 
-			await executeEndReviewAction(ctx, action, {
-				showSummaryLoader: true,
-				notifySuccess: true,
-			});
+			let selectedFindings: ReviewFinding[] | undefined;
+			if (action === "returnAndFix") {
+				const selection = await selectFindingsToFix(ctx);
+				if (selection === null) {
+					ctx.ui.notify("Cancelled. Use /end-review to try again.", "info");
+					return;
+				}
+				if (selection !== "all") selectedFindings = selection;
+			}
+
+			await executeEndReviewAction(
+				ctx,
+				action,
+				{ showSummaryLoader: true, notifySuccess: true },
+				selectedFindings,
+			);
 		} finally {
 			endReviewInProgress = false;
 		}
