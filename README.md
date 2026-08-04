@@ -66,3 +66,9 @@ When a review session is active, finish it with:
 ```
 
 You can then return only, return + summarize, or return + queue fixing work.
+
+Choosing "Return and fix findings" opens a picker of the findings parsed from the review
+report: a checkbox list on the left, the full finding (problem, current code, suggested
+fix, impact) rendered on the right, taking up half the terminal height. `j`/`k` (or `↑↓`)
+move, `space` toggles, `a`/`n` select all/none, `←→` page the detail pane, `enter` confirms. Only the checked findings are handed to the
+follow-up fix turn.
