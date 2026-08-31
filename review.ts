@@ -1054,7 +1054,7 @@ async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding
 				detailOffset = Math.min(detailOffset, Math.max(0, pane.length - rows));
 				const paneWindow = pane.slice(detailOffset, detailOffset + rows);
 
-				const height = Math.max(listRows.length, paneWindow.length);
+				const height = rows;
 				const separator = theme.fg("borderMuted", "\u2502");
 				const body: string[] = [];
 				for (let i = 0; i < height; i++) {
