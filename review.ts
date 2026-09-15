@@ -31,6 +31,15 @@
  *   plus the PR description in PR mode. The review then reports a separate Spec
  *   section covering missing requirements, scope creep and wrong implementations.
  *
+ * Target validation:
+ * - Before the turn starts the ref must resolve, the diff must be non-empty and
+ *   folder paths must exist; otherwise the command fails with a notification.
+ *
+ * Finding shape and /end-review:
+ * - Every finding is a `### [Pn] title — path:line` heading with Problem, Current,
+ *   Fix and Impact parts. "Return and fix findings" parses them from the report and
+ *   shows a checkbox picker; only the checked findings are sent to the fix turn.
+ *
  * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
  */
 
@@ -290,7 +299,7 @@ Rules for this section:
 
 ## Spec conformance (second axis)
 
-If a spec is supplied below (Linear issue, GitHub issue, PR description, or a spec file), review the change on a **second, separate axis**: does the diff faithfully implement what the spec asked for?
+If a spec is supplied below (Linear issue, GitHub issue, or PR description), review the change on a **second, separate axis**: does the diff faithfully implement what the spec asked for?
 
 Report spec findings under their own \`## Spec\` heading, kept separate from the defect findings. Do not merge or rerank across the two axes - a change can follow every guideline while implementing the wrong thing, and vice versa. For each spec finding, quote the spec line it comes from and cover:
 
