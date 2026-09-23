@@ -114,8 +114,9 @@ a note telling the model to read the rest from disk.
 ```
 
 You can return only, return and summarize, or return and fix findings. Summarizing
-produces a handoff with scope, verdict, the findings in their original shape, an ordered
-fix queue, and the human callouts.
+has the model write the scope, follow-up discussion, fix queue, and constraints, then
+appends the review report verbatim. The report is copied as-is because pi caps branch
+summaries at 4096 output tokens, which a model-copied report with code blocks exceeds.
 
 "Return and fix findings" opens a picker of the findings parsed from the review report.
 The left side is a checkbox list, everything checked by default, with priority colours and

@@ -44,7 +44,13 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, BorderedLoader, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import {
+	DynamicBorder,
+	BorderedLoader,
+	collectEntriesForBranchSummary,
+	generateBranchSummary,
+	getMarkdownTheme,
+} from "@earendil-works/pi-coding-agent";
 import {
 	Container,
 	fuzzyFilter,
@@ -68,6 +74,13 @@ import { promises as fs } from "node:fs";
 let reviewOriginId: string | undefined = undefined;
 let endReviewInProgress = false;
 let reviewCustomInstructions: string | undefined = undefined;
+let pendingReviewSummary: ReviewSummary | undefined = undefined;
+
+type ReviewSummary = {
+	summary: string;
+	details: { readFiles: string[]; modifiedFiles: string[] };
+	usage?: Awaited<ReturnType<typeof generateBranchSummary>>["usage"];
+};
 
 const REVIEW_STATE_TYPE = "review-session";
 const REVIEW_ANCHOR_TYPE = "review-anchor";
@@ -1205,6 +1218,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		applyAllReviewState(ctx);
 	});
 
+	pi.on("session_before_tree", (event) => {
+		if (!pendingReviewSummary || !event.preparation.userWantsSummary) return;
+		return { summary: pendingReviewSummary };
+	});
+
 	/**
 	 * Determine the smart default review type based on git state
 	 */
@@ -2009,6 +2027,28 @@ These are informational callouts for humans and are not fix items by themselves.
 
 Preserve exact file paths, function names, and error messages where available.`;
 
+	const REVIEW_HANDOFF_PROMPT = `We are leaving a code-review branch and returning to the main coding branch.
+The full review report (findings with code, verdict, human reviewer callouts) is appended verbatim after your output. Do not repeat it.
+
+Write only what the report does not already contain, in these sections (in order):
+
+## Review Scope
+- What was reviewed (target, files/paths)
+
+## Follow-up Discussion
+- Findings that the discussion after the report invalidated, amended, or added; reference existing findings by priority and title
+- New findings use the report's finding shape
+- Or "(none)"
+
+## Fix Queue
+1. Ordered checklist of finding titles, highest priority first, excluding invalidated findings
+
+## Constraints & Preferences
+- Any constraints or preferences mentioned during review
+- Or "(none)"
+
+Keep it short. Preserve exact file paths, function names, and error messages.`;
+
 	const REVIEW_FIX_FINDINGS_PROMPT = `Use the latest review summary in this session and implement the review findings now.
 
 Instructions:
@@ -2078,37 +2118,77 @@ Instructions:
 		pi.appendEntry(REVIEW_STATE_TYPE, { active: false });
 	}
 
+	async function buildReviewSummary(
+		ctx: ExtensionCommandContext,
+		originId: string,
+		signal: AbortSignal,
+	): Promise<ReviewSummary | null> {
+		const model = ctx.model;
+		if (!model) throw new Error("No model available for summarization");
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) throw new Error(auth.error);
+
+		const report = findReviewReport(ctx);
+		const { entries } = collectEntriesForBranchSummary(ctx.sessionManager, ctx.sessionManager.getLeafId(), originId);
+		const result = await generateBranchSummary(entries, {
+			model: auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model,
+			apiKey: auth.apiKey,
+			headers: auth.headers
+				? Object.fromEntries(
+						Object.entries(auth.headers).filter((header): header is [string, string] => header[1] !== null),
+					)
+				: undefined,
+			env: auth.env,
+			signal,
+			customInstructions: report ? REVIEW_HANDOFF_PROMPT : REVIEW_SUMMARY_PROMPT,
+			replaceInstructions: true,
+		});
+		if (result.aborted) return null;
+		if (result.error || !result.summary) throw new Error(result.error ?? "Branch summarization returned no summary");
+
+		return {
+			summary: report ? `${result.summary}\n\n# Review Report (verbatim)\n\n${report}` : result.summary,
+			details: { readFiles: result.readFiles ?? [], modifiedFiles: result.modifiedFiles ?? [] },
+			usage: result.usage,
+		};
+	}
+
+	async function summarizeAndNavigate(
+		ctx: ExtensionCommandContext,
+		originId: string,
+		signal: AbortSignal,
+	): Promise<{ cancelled: boolean; error?: string } | null> {
+		try {
+			const summary = await buildReviewSummary(ctx, originId, signal);
+			if (!summary) return null;
+			pendingReviewSummary = summary;
+			return await ctx.navigateTree(originId, { summarize: true });
+		} catch (error) {
+			return { cancelled: false, error: error instanceof Error ? error.message : String(error) };
+		} finally {
+			pendingReviewSummary = undefined;
+		}
+	}
+
 	async function navigateWithSummary(
 		ctx: ExtensionCommandContext,
 		originId: string,
 		showLoader: boolean,
 	): Promise<{ cancelled: boolean; error?: string } | null> {
-		if (showLoader && ctx.hasUI) {
-			return ctx.ui.custom<{ cancelled: boolean; error?: string } | null>((tui, theme, _kb, done) => {
-				const loader = new BorderedLoader(tui, theme, "Returning and summarizing review branch...");
-				loader.onAbort = () => done(null);
-
-				ctx.navigateTree(originId, {
-					summarize: true,
-					customInstructions: REVIEW_SUMMARY_PROMPT,
-					replaceInstructions: true,
-				})
-					.then(done)
-					.catch((err) => done({ cancelled: false, error: err instanceof Error ? err.message : String(err) }));
-
-				return loader;
-			});
+		const controller = new AbortController();
+		if (!showLoader || !ctx.hasUI) {
+			return summarizeAndNavigate(ctx, originId, controller.signal);
 		}
 
-		try {
-			return await ctx.navigateTree(originId, {
-				summarize: true,
-				customInstructions: REVIEW_SUMMARY_PROMPT,
-				replaceInstructions: true,
-			});
-		} catch (error) {
-			return { cancelled: false, error: error instanceof Error ? error.message : String(error) };
-		}
+		return ctx.ui.custom<{ cancelled: boolean; error?: string } | null>((tui, theme, _kb, done) => {
+			const loader = new BorderedLoader(tui, theme, "Returning and summarizing review branch...");
+			loader.onAbort = () => {
+				controller.abort();
+				done(null);
+			};
+			summarizeAndNavigate(ctx, originId, controller.signal).then(done);
+			return loader;
+		});
 	}
 
 	async function executeEndReviewAction(
