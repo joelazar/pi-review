@@ -113,7 +113,8 @@ a note telling the model to read the rest from disk.
 /end-review
 ```
 
-You can return only, return and summarize, or return and fix findings. Summarizing
+You can return only, return and summarize, return and fix findings, or return and
+comment on the PR (listed only when HEAD has an open GitHub PR). Summarizing
 has the model write the scope, follow-up discussion, fix queue, and constraints, then
 appends the review report verbatim. The report is copied as-is because pi caps branch
 summaries at 4096 output tokens, which a model-copied report with code blocks exceeds.
@@ -129,3 +130,46 @@ the detail pane, `enter` confirms, `esc` cancels.
 Only the checked findings are handed to the follow-up fix turn, which is told to ignore
 everything else in the summary. If the report has no parseable findings, the fix turn
 works from the full summary instead.
+
+## Commenting on the PR
+
+"Return and comment on PR" turns the checked findings into a pending GitHub review. It
+is blocked when the PR head moved past your local `HEAD`.
+
+1. Pick findings in the findings picker.
+2. The session model drafts a review body plus one comment per finding, in your review
+   voice, taking the discussion after the report into account.
+3. Each comment is anchored against `gh pr diff`: a line thread when the lines sit inside
+   a hunk, a file thread when the file changed but the lines did not, otherwise it is
+   appended to the review body. A ```` ```suggestion ```` block survives only when the
+   anchored lines still match the finding's **Current** block.
+4. The drafts picker uses the same keys as the findings picker, plus `e` to edit a draft.
+   Drafts that already have a thread of yours in the pending review start unchecked.
+5. `enter` posts into your pending review (created if missing). On error the picker
+   reopens and `enter` retries only what was not posted yet.
+
+Submitting the review stays on GitHub. Verdicts and human callouts are never posted.
+
+### Review voice
+
+The first file found wins:
+
+1. `REVIEW_VOICE.md`, walking up from the working directory to the repo root
+2. `~/.pi/agent/review-voice.md`
+3. Built-in default: Conventional Comments (`issue:`, `suggestion:`, `nitpick:`,
+   `question:`), one to three sentences, suggestion blocks only for small fixes
+
+Example `REVIEW_VOICE.md`:
+
+```markdown
+# Review voice
+
+- One or two sentences, lowercase start, no greeting.
+- Open with a tag: `[ISSUE]`, `[SUGGESTION]`, `[NITPICK]` or `[QUESTION]`.
+- Say what is wrong, then the fix. Prefer a ```suggestion block for one-line fixes.
+- Hedge with a question when unsure about intent.
+- File-level comments start with `File-level:` after the tag.
+- Review body: one line or empty.
+```
+
+`npm run check` runs the self-check for diff parsing, anchoring and the suggestion guard.

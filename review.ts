@@ -48,6 +48,8 @@ import {
 	DynamicBorder,
 	BorderedLoader,
 	collectEntriesForBranchSummary,
+	convertToLlm,
+	serializeConversation,
 	generateBranchSummary,
 	getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
@@ -67,6 +69,17 @@ import {
 } from "@earendil-works/pi-tui";
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import os from "node:os";
+import {
+	type AnchorKind,
+	classifyAnchor,
+	type DraftComment,
+	type DraftResponse,
+	extractCurrentBlock,
+	guardSuggestion,
+	parseDiffHunks,
+	parseDraftResponse,
+} from "./pr-comments.ts";
 
 // State to track fresh session review (where we branched from).
 // Module-level state means only one review can be active at a time.
@@ -389,24 +402,45 @@ const GUIDELINE_FILENAMES = [
 const GUIDELINE_MAX_CHARS = 12_000;
 
 /**
- * Walk up from `cwd` collecting standards documents, stopping after the repo root
- * (the first directory containing `.git` or `.pi`).
+ * Directories from `cwd` up to and including the repo root (the first directory
+ * containing `.git` or `.pi`).
+ */
+async function dirsUpToRepoRoot(cwd: string): Promise<string[]> {
+	const dirs: string[] = [];
+	let currentDir = path.resolve(cwd);
+	while (true) {
+		dirs.push(currentDir);
+		const isRepoRoot =
+			(await fs.stat(path.join(currentDir, ".git")).catch(() => null)) !== null ||
+			(await fs.stat(path.join(currentDir, ".pi")).catch(() => null))?.isDirectory() === true;
+		const parentDir = path.dirname(currentDir);
+		if (isRepoRoot || parentDir === currentDir) return dirs;
+		currentDir = parentDir;
+	}
+}
+
+async function readFileIfExists(filePath: string): Promise<string | null> {
+	const stats = await fs.stat(filePath).catch(() => null);
+	return stats?.isFile() ? fs.readFile(filePath, "utf8") : null;
+}
+
+/**
+ * Collect standards documents from `cwd` up to the repo root; the first match per filename wins.
  */
 async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> {
 	const sections: string[] = [];
 	const seenNames = new Set<string>();
-	let currentDir = path.resolve(cwd);
 
-	while (true) {
+	for (const dir of await dirsUpToRepoRoot(cwd)) {
 		for (const name of GUIDELINE_FILENAMES) {
 			if (seenNames.has(name)) continue;
 
-			const filePath = path.join(currentDir, name);
-			const stats = await fs.stat(filePath).catch(() => null);
-			if (!stats?.isFile()) continue;
+			const filePath = path.join(dir, name);
+			const raw = await readFileIfExists(filePath);
+			if (raw === null) continue;
 
 			seenNames.add(name);
-			const content = (await fs.readFile(filePath, "utf8")).trim();
+			const content = raw.trim();
 			if (!content) continue;
 
 			const body =
@@ -415,17 +449,32 @@ async function loadProjectReviewGuidelines(cwd: string): Promise<string | null> 
 					: content;
 			sections.push(`### ${filePath}\n\n${body}`);
 		}
-
-		const isRepoRoot =
-			(await fs.stat(path.join(currentDir, ".git")).catch(() => null)) !== null ||
-			(await fs.stat(path.join(currentDir, ".pi")).catch(() => null))?.isDirectory() === true;
-
-		const parentDir = path.dirname(currentDir);
-		if (isRepoRoot || parentDir === currentDir) break;
-		currentDir = parentDir;
 	}
 
 	return sections.length > 0 ? sections.join("\n\n") : null;
+}
+
+const DEFAULT_REVIEW_VOICE = `Write PR review comments as Conventional Comments.
+
+- Start each comment with a label: \`issue:\`, \`suggestion:\`, \`nitpick:\` or \`question:\`.
+- One to three sentences: what is wrong and what to do instead.
+- Never quote the current code back to the author; the comment is already anchored to it.
+- Use a \`\`\`suggestion block only for a small fix that replaces exactly the commented lines.
+- The review body is one or two sentences, or empty.`;
+
+/**
+ * REVIEW_VOICE.md walking up to the repo root, then ~/.pi/agent/review-voice.md, then the built-in default.
+ */
+async function loadReviewVoice(cwd: string): Promise<string> {
+	const candidates = [
+		...(await dirsUpToRepoRoot(cwd)).map((dir) => path.join(dir, "REVIEW_VOICE.md")),
+		path.join(os.homedir(), ".pi", "agent", "review-voice.md"),
+	];
+	for (const candidate of candidates) {
+		const content = (await readFileIfExists(candidate))?.trim();
+		if (content) return content;
+	}
+	return DEFAULT_REVIEW_VOICE;
 }
 
 /**
@@ -558,6 +607,18 @@ async function getPrInfo(pi: ExtensionAPI, prNumber: number): Promise<{ baseBran
 	} catch {
 		return null;
 	}
+}
+
+type OpenPr = { id: string; number: number; url: string; headRefOid: string };
+
+/**
+ * The open PR for HEAD, or null when there is none or `gh` is missing/unauthenticated.
+ */
+async function getOpenPrForHead(pi: ExtensionAPI): Promise<OpenPr | null> {
+	const { stdout, code } = await pi.exec("gh", ["pr", "view", "--json", "id,number,url,headRefOid,state"]);
+	if (code !== 0) return null;
+	const pr = JSON.parse(stdout) as OpenPr & { state: string };
+	return pr.state === "OPEN" ? pr : null;
 }
 
 /**
@@ -916,15 +977,19 @@ const BARE_LOCATION = /(?:^|[\s(\[`\u2014-])([\w./@-]+\.[A-Za-z][\w]*(?::\d+(?:-
  * The last assistant message in the branch that produced a review report.
  */
 function findReviewReport(ctx: ExtensionContext): string | undefined {
-	let report: string | undefined;
-	for (const entry of ctx.sessionManager.getBranch()) {
+	return findReviewReportEntry(ctx)?.text;
+}
+
+function findReviewReportEntry(ctx: ExtensionContext): { text: string; index: number } | undefined {
+	let report: { text: string; index: number } | undefined;
+	for (const [index, entry] of ctx.sessionManager.getBranch().entries()) {
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 		const text = entry.message.content
 			.filter((block): block is { type: "text"; text: string } => block.type === "text")
 			.map((block) => block.text)
 			.join("\n");
 		if (text.split("\n").some((line) => AXIS_HEADING.test(line))) {
-			report = text;
+			report = { text, index };
 		}
 	}
 	return report;
@@ -1019,15 +1084,34 @@ function pickerRows(): number {
 	return Math.max(PICKER_MIN_ROWS, Math.floor((process.stdout.rows ?? 24) / 2));
 }
 
+type ChecklistRow = {
+	tag?: { text: string; color: "error" | "warning" | "text" | "dim" | "accent" | "success" };
+	label: string;
+	markdown: string;
+};
+
+type ChecklistOptions = {
+	title: string;
+	rows: ChecklistRow[];
+	/** Mutated in place so callers keep the selection across reopenings. */
+	checked: boolean[];
+	cursor?: number;
+	error?: string;
+	/** Enables `e`, which closes the picker with the highlighted row. */
+	editable?: boolean;
+	confirmLabel: string;
+};
+
+type ChecklistResult = { action: "confirm" | "edit"; cursor: number } | null;
+
 /**
- * Checkbox list of findings with a detail pane for the highlighted one.
- * Returns the selected findings, or null when cancelled.
+ * Checkbox list with a detail pane for the highlighted row, half the terminal tall.
  */
-async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding[]): Promise<ReviewFinding[] | null> {
-	return ctx.ui.custom<ReviewFinding[] | null>((tui, theme, _kb, done) => {
-		const checked = findings.map(() => true);
+async function showChecklistPicker(ctx: ExtensionContext, options: ChecklistOptions): Promise<ChecklistResult> {
+	const { rows: items, checked } = options;
+	return ctx.ui.custom<ChecklistResult>((tui, theme, _kb, done) => {
 		const mdTheme = getMarkdownTheme();
-		let cursor = 0;
+		let cursor = options.cursor ?? 0;
 		let listOffset = 0;
 		let detailOffset = 0;
 		let detail: Markdown | null = null;
@@ -1036,18 +1120,19 @@ async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding
 
 		const detailLines = (width: number): string[] => {
 			if (detailFor !== cursor || !detail) {
-				detail = new Markdown(formatFindingMarkdown(findings[cursor]), 0, 0, mdTheme);
+				detail = new Markdown(items[cursor].markdown, 0, 0, mdTheme);
 				detailFor = cursor;
 			}
 			return detail.render(width);
 		};
 
 		const moveCursor = (delta: number) => {
-			cursor = Math.min(findings.length - 1, Math.max(0, cursor + delta));
+			cursor = Math.min(items.length - 1, Math.max(0, cursor + delta));
 			if (cursor < listOffset) listOffset = cursor;
 			if (cursor >= listOffset + rows) listOffset = cursor - rows + 1;
 			detailOffset = 0;
 		};
+		moveCursor(0);
 
 		return {
 			render(width: number): string[] {
@@ -1056,18 +1141,15 @@ async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding
 				const paneWidth = Math.max(20, width - listWidth - 3);
 
 				const selectedCount = checked.filter(Boolean).length;
-				const header = theme.fg(
-					"accent",
-					theme.bold(`Select findings to fix (${selectedCount}/${findings.length})`),
-				);
+				const header = theme.fg("accent", theme.bold(`${options.title} (${selectedCount}/${items.length})`));
 
 				const listRows: string[] = [];
-				const visible = findings.slice(listOffset, listOffset + rows);
-				visible.forEach((finding, index) => {
+				const visible = items.slice(listOffset, listOffset + rows);
+				visible.forEach((item, index) => {
 					const absolute = listOffset + index;
 					const box = checked[absolute] ? "[x]" : "[ ]";
-					const axisTag = finding.axis === "Spec" ? "spec " : "";
-					const label = `${box} ${theme.fg(priorityColor(finding.priority), finding.priority)} ${axisTag}${finding.title}`;
+					const tag = item.tag ? `${theme.fg(item.tag.color, item.tag.text)} ` : "";
+					const label = `${box} ${tag}${item.label}`;
 					const prefix = absolute === cursor ? theme.fg("accent", "\u276f ") : "  ";
 					listRows.push(truncateToWidth(`${prefix}${label}`, listWidth, "\u2026"));
 				});
@@ -1076,22 +1158,23 @@ async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding
 				detailOffset = Math.min(detailOffset, Math.max(0, pane.length - rows));
 				const paneWindow = pane.slice(detailOffset, detailOffset + rows);
 
-				const height = rows;
 				const separator = theme.fg("borderMuted", "\u2502");
 				const body: string[] = [];
-				for (let i = 0; i < height; i++) {
+				for (let i = 0; i < rows; i++) {
 					const left = listRows[i] ?? "";
 					const padding = " ".repeat(Math.max(0, listWidth - visibleWidth(left)));
 					body.push(`${left}${padding} ${separator} ${paneWindow[i] ?? ""}`);
 				}
 
 				const scrollHint = pane.length > rows ? " \u2022 \u2190\u2192 scroll detail" : "";
+				const editHint = options.editable ? " \u2022 e edit" : "";
 				const footer = theme.fg(
 					"dim",
-					`j/k move \u2022 space toggle \u2022 a all \u2022 n none${scrollHint} \u2022 enter confirm \u2022 esc cancel`,
+					`j/k move \u2022 space toggle \u2022 a all \u2022 n none${editHint}${scrollHint} \u2022 enter ${options.confirmLabel} \u2022 esc cancel`,
 				);
+				const error = options.error ? [truncateToWidth(theme.fg("error", options.error), width, "\u2026")] : [];
 
-				return [header, "", ...body, "", footer];
+				return [header, ...error, "", ...body, "", footer];
 			},
 			invalidate() {
 				detail = null;
@@ -1105,12 +1188,31 @@ async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding
 				else if (matchesKey(data, Key.space)) checked[cursor] = !checked[cursor];
 				else if (data === "a") checked.fill(true);
 				else if (data === "n") checked.fill(false);
+				else if (data === "e" && options.editable) done({ action: "edit", cursor });
 				else if (matchesKey(data, Key.escape)) done(null);
-				else if (matchesKey(data, Key.enter)) done(findings.filter((_, index) => checked[index]));
+				else if (matchesKey(data, Key.enter)) done({ action: "confirm", cursor });
 				tui.requestRender();
 			},
 		};
 	});
+}
+
+/**
+ * Checkbox list of findings. Returns the selected findings, or null when cancelled.
+ */
+async function showFindingsPicker(ctx: ExtensionContext, findings: ReviewFinding[]): Promise<ReviewFinding[] | null> {
+	const checked = findings.map(() => true);
+	const result = await showChecklistPicker(ctx, {
+		title: "Select findings",
+		rows: findings.map((finding) => ({
+			tag: { text: finding.priority, color: priorityColor(finding.priority) },
+			label: `${finding.axis === "Spec" ? "spec " : ""}${finding.title}`,
+			markdown: formatFindingMarkdown(finding),
+		})),
+		checked,
+		confirmLabel: "confirm",
+	});
+	return result ? findings.filter((_, index) => checked[index]) : null;
 }
 
 const TOGGLE_CUSTOM_INSTRUCTIONS_VALUE = "toggleCustomInstructions" as const;
@@ -2264,6 +2366,297 @@ Instructions:
 		return "ok";
 	}
 
+	const COMMENT_ON_PR_CHOICE = "Return and comment on PR";
+
+	const PR_DRAFT_PROMPT = `You turn code review findings into GitHub pull request review comments.
+
+Write every comment and the review body in the voice described under "Voice".
+
+Rules:
+1. One comment per finding you still stand behind. The discussion after the review can invalidate a finding (drop it) or amend it (follow the amended version).
+2. \`finding\` is the finding number. \`path\` is repo-relative. \`line\` is the line in the new version of the file; add \`startLine\` only for a multi-line range. Omit \`path\`/\`line\` when the finding has no location.
+3. Never include verdicts or Human Reviewer Callouts, in the body or in comments.
+4. Reply with JSON only, no prose and no code fence:
+{ "body": string, "comments": [{ "finding": number, "path": string, "line": number, "startLine"?: number, "body": string }] }`;
+
+	function discussionAfterReport(ctx: ExtensionContext, reportIndex: number): string {
+		const messages = ctx.sessionManager
+			.getBranch()
+			.slice(reportIndex + 1)
+			.flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+		return messages.length > 0 ? serializeConversation(convertToLlm(messages)) : "(none)";
+	}
+
+	async function draftPrComments(
+		ctx: ExtensionCommandContext,
+		findings: ReviewFinding[],
+		reportIndex: number,
+	): Promise<DraftResponse | null> {
+		const model = ctx.model;
+		if (!model) throw new Error("No model available for drafting");
+		const voice = await loadReviewVoice(ctx.cwd);
+		const numbered = findings.map((finding, index) => `## Finding ${index + 1}\n\n${formatFindingMarkdown(finding)}`);
+		const prompt = `# Voice\n\n${voice}\n\n# Findings\n\n${numbered.join("\n\n")}\n\n# Discussion after the review\n\n${discussionAfterReport(ctx, reportIndex)}`;
+
+		return ctx.ui.custom<DraftResponse | null>((tui, theme, _kb, done) => {
+			const loader = new BorderedLoader(tui, theme, "Drafting PR comments...");
+			loader.onAbort = () => done(null);
+			ctx.modelRegistry
+				.complete(
+					model,
+					{
+						systemPrompt: PR_DRAFT_PROMPT,
+						messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
+					},
+					{ signal: loader.signal },
+				)
+				.then((response) => {
+					if (response.stopReason === "aborted") return done(null);
+					if (response.stopReason === "error") throw new Error(response.errorMessage ?? "Drafting failed");
+					const text = response.content
+						.filter((block): block is { type: "text"; text: string } => block.type === "text")
+						.map((block) => block.text)
+						.join("\n");
+					done(parseDraftResponse(text));
+				})
+				.catch((error) => {
+					ctx.ui.notify(`Drafting failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+					done(null);
+				});
+			return loader;
+		});
+	}
+
+	type PrThread = DraftComment & { kind: Exclude<AnchorKind, "body"> };
+
+	/**
+	 * Anchor drafts against the PR diff: line and file threads, plus the review body
+	 * with the unanchorable comments appended.
+	 */
+	async function anchorDrafts(
+		pr: OpenPr,
+		drafts: DraftResponse,
+		findings: ReviewFinding[],
+	): Promise<{ body: string; threads: PrThread[] }> {
+		const { stdout: diff, stderr, code } = await pi.exec("gh", ["pr", "diff", String(pr.number)]);
+		if (code !== 0) throw new Error(`gh pr diff failed: ${stderr.trim() || diff.trim()}`);
+		const files = parseDiffHunks(diff);
+
+		const bodyParts = drafts.body.trim() ? [drafts.body.trim()] : [];
+		const threads: PrThread[] = [];
+		for (const comment of drafts.comments) {
+			const kind = classifyAnchor(files, comment);
+			const finding = findings[comment.finding - 1];
+			const fileText =
+				kind === "line" ? (await pi.exec("git", ["show", `${pr.headRefOid}:${comment.path}`])).stdout : null;
+			const body = guardSuggestion(comment, kind, fileText, finding ? extractCurrentBlock(finding.body) : null);
+			const location = comment.path ? `${comment.path}${comment.line === undefined ? "" : `:${comment.line}`}` : "";
+			const located = location && !body.includes(location) ? `\`${location}\`: ${body}` : body;
+			if (kind === "body") bodyParts.push(located);
+			else threads.push({ ...comment, kind, body: kind === "file" ? located : body });
+		}
+		return { body: bodyParts.join("\n\n"), threads };
+	}
+
+	async function ghGraphql<T>(query: string, variables: Record<string, string | number | undefined>): Promise<T> {
+		const args = ["api", "graphql", "-f", `query=${query}`];
+		for (const [name, value] of Object.entries(variables)) {
+			if (value !== undefined) args.push(typeof value === "number" ? "-F" : "-f", `${name}=${value}`);
+		}
+		const { stdout, stderr, code } = await pi.exec("gh", args);
+		const response = stdout.trim() ? (JSON.parse(stdout) as { data?: T; errors?: Array<{ message: string }> }) : {};
+		if (response.errors?.length) throw new Error(response.errors.map((error) => error.message).join("; "));
+		if (code !== 0 || !response.data) throw new Error(stderr.trim() || "gh api graphql failed");
+		return response.data;
+	}
+
+	type PendingReview = { id: string; threads: Array<{ path: string; line: number | null }> };
+
+	async function findPendingReview(pr: OpenPr): Promise<PendingReview | undefined> {
+		type Data = {
+			node: {
+				reviews: {
+					nodes: Array<{
+						id: string;
+						viewerDidAuthor: boolean;
+						comments: { nodes: Array<{ path: string; line: number | null }> };
+					}>;
+				};
+			};
+		};
+		const data = await ghGraphql<Data>(
+			`query($id: ID!) { node(id: $id) { ... on PullRequest { reviews(states: [PENDING], first: 20) { nodes { id viewerDidAuthor comments(first: 100) { nodes { path line } } } } } } }`,
+			{ id: pr.id },
+		);
+		const mine = data.node.reviews.nodes.find((review) => review.viewerDidAuthor);
+		return mine && { id: mine.id, threads: mine.comments.nodes };
+	}
+
+	type DraftsState = {
+		pr: OpenPr;
+		reviewId?: string;
+		/** Index 0 is the review body, then one entry per thread. */
+		bodies: string[];
+		threads: PrThread[];
+		checked: boolean[];
+		posted: boolean[];
+		alreadyPosted: boolean[];
+	};
+
+	function postedLine(thread: PrThread): number | null {
+		return thread.kind === "line" ? (thread.line ?? null) : null;
+	}
+
+	function draftRows(state: DraftsState): ChecklistRow[] {
+		const status = (index: number) =>
+			state.posted[index] ? " (posted)" : state.alreadyPosted[index] ? " (already posted)" : "";
+		return [
+			{
+				tag: { text: "body", color: "accent" },
+				label: `Review body${status(0)}`,
+				markdown: state.bodies[0] || "_(empty review body)_",
+			},
+			...state.threads.map((thread, index) => {
+				const location = `${thread.path}${thread.line === undefined ? "" : `:${thread.startLine ? `${thread.startLine}-` : ""}${thread.line}`}`;
+				return {
+					tag: { text: thread.kind, color: thread.kind === "line" ? "success" : "warning" } as const,
+					label: `${location}${status(index + 1)}`,
+					markdown: `\`${location}\` (${thread.kind} thread)\n\n${state.bodies[index + 1]}`,
+				};
+			}),
+		];
+	}
+
+	/**
+	 * Post every checked, unposted draft into my pending review. Marks each success so a
+	 * retry after an error only sends what is left.
+	 */
+	async function postDrafts(state: DraftsState): Promise<void> {
+		if (!state.reviewId) {
+			const data = await ghGraphql<{ addPullRequestReview: { pullRequestReview: { id: string } } }>(
+				`mutation($pr: ID!, $oid: GitObjectID!) { addPullRequestReview(input: { pullRequestId: $pr, commitOID: $oid }) { pullRequestReview { id } } }`,
+				{ pr: state.pr.id, oid: state.pr.headRefOid },
+			);
+			state.reviewId = data.addPullRequestReview.pullRequestReview.id;
+		}
+
+		if (state.checked[0] && !state.posted[0]) {
+			await ghGraphql(
+				`mutation($id: ID!, $body: String!) { updatePullRequestReview(input: { pullRequestReviewId: $id, body: $body }) { clientMutationId } }`,
+				{ id: state.reviewId, body: state.bodies[0] },
+			);
+			state.posted[0] = true;
+		}
+
+		for (const [index, thread] of state.threads.entries()) {
+			const row = index + 1;
+			if (!state.checked[row] || state.posted[row]) continue;
+			const line = postedLine(thread) ?? undefined;
+			await ghGraphql(
+				`mutation($id: ID!, $path: String!, $body: String!, $line: Int, $startLine: Int, $subjectType: PullRequestReviewThreadSubjectType!) { addPullRequestReviewThread(input: { pullRequestReviewId: $id, path: $path, body: $body, line: $line, startLine: $startLine, subjectType: $subjectType }) { thread { id } } }`,
+				{
+					id: state.reviewId,
+					path: thread.path,
+					body: state.bodies[row],
+					line,
+					startLine: line !== undefined && thread.startLine !== undefined && thread.startLine < line ? thread.startLine : undefined,
+					subjectType: thread.kind === "line" ? "LINE" : "FILE",
+				},
+			);
+			state.posted[row] = true;
+		}
+	}
+
+	/**
+	 * Drafts picker loop: edit, post, and on failure reopen with the error and retry.
+	 * Returns true once everything checked is posted.
+	 */
+	async function reviewAndPostDrafts(ctx: ExtensionCommandContext, state: DraftsState): Promise<boolean> {
+		let cursor = 0;
+		let error: string | undefined;
+		while (true) {
+			const result = await showChecklistPicker(ctx, {
+				title: `PR #${state.pr.number} review drafts`,
+				rows: draftRows(state),
+				checked: state.checked,
+				cursor,
+				error,
+				editable: true,
+				confirmLabel: "post",
+			});
+			if (!result) return false;
+			cursor = result.cursor;
+
+			if (result.action === "edit") {
+				const edited = await ctx.ui.editor("Edit draft", state.bodies[cursor]);
+				if (edited !== undefined) state.bodies[cursor] = edited;
+				continue;
+			}
+
+			try {
+				await postDrafts(state);
+				return true;
+			} catch (postError) {
+				error = `Posting failed: ${postError instanceof Error ? postError.message : String(postError)}`;
+			}
+		}
+	}
+
+	async function commentOnPr(ctx: ExtensionCommandContext, pr: OpenPr): Promise<void> {
+		const { stdout: head } = await pi.exec("git", ["rev-parse", "HEAD"]);
+		if (head.trim() !== pr.headRefOid) {
+			ctx.ui.notify(`PR moved to \`${pr.headRefOid.slice(0, 7)}\`, pull or re-review first.`, "error");
+			return;
+		}
+
+		const report = findReviewReportEntry(ctx);
+		const findings = report ? parseReviewFindings(report.text) : [];
+		if (!report || findings.length === 0) {
+			ctx.ui.notify("No findings in the review report to post.", "info");
+			return;
+		}
+		const selected = await showFindingsPicker(ctx, findings);
+		if (!selected?.length) {
+			ctx.ui.notify("Cancelled. Use /end-review to try again.", "info");
+			return;
+		}
+
+		const drafts = await draftPrComments(ctx, selected, report.index);
+		if (!drafts) return;
+		let state: DraftsState;
+		try {
+			const [anchored, pending] = await Promise.all([anchorDrafts(pr, drafts, selected), findPendingReview(pr)]);
+			const alreadyPosted = [
+				false,
+				...anchored.threads.map((thread) =>
+					(pending?.threads ?? []).some(
+						(existing) => existing.path === thread.path && existing.line === postedLine(thread),
+					),
+				),
+			];
+			state = {
+				pr,
+				reviewId: pending?.id,
+				bodies: [anchored.body, ...anchored.threads.map((thread) => thread.body)],
+				threads: anchored.threads,
+				checked: alreadyPosted.map((posted) => !posted),
+				posted: alreadyPosted.map(() => false),
+				alreadyPosted,
+			};
+		} catch (error) {
+			ctx.ui.notify(`Preparing PR comments failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+
+		if (!(await reviewAndPostDrafts(ctx, state))) {
+			ctx.ui.notify("Cancelled. Use /end-review to try again.", "info");
+			return;
+		}
+
+		const result = await executeEndReviewAction(ctx, "returnOnly", { notifySuccess: false });
+		if (result === "ok") ctx.ui.notify(`Pending review updated, submit it on GitHub: ${pr.url}`, "info");
+	}
+
 	async function runEndReview(ctx: ExtensionCommandContext): Promise<void> {
 		if (!ctx.hasUI) {
 			ctx.ui.notify("End-review requires interactive mode", "error");
@@ -2278,14 +2671,21 @@ Instructions:
 
 		endReviewInProgress = true;
 		try {
+			const pr = await getOpenPrForHead(pi);
 			const choice = await ctx.ui.select("Finish review:", [
 				"Return only",
 				"Return and fix findings",
 				"Return and summarize",
+				...(pr ? [COMMENT_ON_PR_CHOICE] : []),
 			]);
 
 			if (choice === undefined) {
 				ctx.ui.notify("Cancelled. Use /end-review to try again.", "info");
+				return;
+			}
+
+			if (choice === COMMENT_ON_PR_CHOICE && pr) {
+				await commentOnPr(ctx, pr);
 				return;
 			}
 

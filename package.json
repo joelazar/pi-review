@@ -30,6 +30,7 @@
     "typescript": "^5.8.3"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "node pr-comments.check.ts"
   }
 }
