@@ -766,9 +766,10 @@ function truncateSpec(content: string): string {
 
 /**
  * Commit subjects and bodies for the range, used to sniff out issue references.
+ * First-parent only: commits merged in from the base branch carry other PRs' refs.
  */
 async function getCommitMessages(pi: ExtensionAPI, range: string): Promise<string> {
-	const { stdout, code } = await pi.exec("git", ["log", "--format=%s%n%b", range]);
+	const { stdout, code } = await pi.exec("git", ["log", "--first-parent", "--no-merges", "--format=%s%n%b", range]);
 	return code === 0 ? stdout : "";
 }
 
