@@ -35,7 +35,7 @@
  *
  * Report shape:
  * - The report opens with a `## Summary` of what the change does, then Findings,
- *   Spec, verdict and Human Reviewer Callouts.
+ *   Spec, Verdict and Human Reviewer Callouts.
  *
  * Target validation:
  * - Before the turn starts the ref must resolve, the diff must be non-empty and
@@ -222,7 +222,7 @@ Below are default guidelines for determining what to flag. These are not the fin
 
 ## Reading the change
 
-Read the whole change. Run the diff with \`--stat\` first, then read it one file at a time (\`git diff <base> -- <file>\`). Never cut diff output with \`head\`, \`tail\` or line ranges, and don't dump it to a temp file to page through. Every changed file must be read before you write the verdict.
+Read the whole change. Run the diff with \`--stat\` first, then read it one file at a time (\`git diff <base> -- <file>\`). Never cut diff output with \`head\`, \`tail\` or line ranges, and don't dump it to a temp file to page through. Untracked files never show in \`git diff\`: list them with \`git status --short\` and read them directly. A snapshot (folder) review has no diff: read every file in the given paths instead. Every changed file must be read before you write the verdict.
 
 ## Determining what to flag
 
@@ -281,12 +281,10 @@ Each smell reads *what it is* -> *how to fix*; match it against the diff:
 1. Be clear about why the issue is a problem.
 2. Communicate severity appropriately - don't exaggerate.
 3. Be brief - the prose around each finding is at most one short paragraph; let the code carry the rest.
-4. Show, don't just tell: quote the offending code and show the fix as code. Keep each block to the smallest span that makes the point (usually under 10 lines), never a whole function unless the whole function is the problem.
-5. The **Fix** block holds ONLY concrete replacement code (no commentary inside the block). Preserve the exact leading whitespace of the replaced lines.
-6. Explicitly state scenarios/environments where the issue arises.
-7. Use a matter-of-fact tone - helpful AI assistant, not accusatory.
-8. Write for quick comprehension without close reading.
-9. Avoid excessive flattery or unhelpful phrases like "Great job...".
+4. Explain the mechanism, not only the symptom: name the input or call path that triggers the issue, then what the code does with it. A reader who has not opened the file should follow it.
+5. Spell out every abbreviation and domain term on first use, in plain words ("InsertSubscriberData (ISD)", not "ISD").
+6. Use a matter-of-fact tone - helpful AI assistant, not accusatory.
+7. Avoid excessive flattery or unhelpful phrases like "Great job...".
 
 ## Review priorities
 
@@ -359,9 +357,9 @@ Tag each finding with a priority level in the title:
 Every finding — on both the defect axis and the Spec axis — is a level-3 heading followed by a fixed set of labelled parts:
 
 \`\`\`
-### [P1] Short imperative title — \`path/to/file.ts:42\`
+### [P1] What breaks, in plain words — \`path/to/file.ts:42\`
 
-**Problem:** one or two sentences on what breaks and when.
+**Problem:** what breaks, the input or call path that triggers it, and how.
 
 **Current:**
 \`\`\`ts
@@ -378,9 +376,9 @@ Every finding — on both the defect axis and the Spec axis — is a level-3 hea
 
 Rules:
 1. The heading must start with the priority tag and end with a \`path:line\` location in backticks.
-2. **Current** and **Fix** are required whenever the finding is about concrete code. Copy the current code verbatim from the file — do not paraphrase it.
-3. Copy code with the file's own indentation and nothing else. Never carry over diff markers (\`+\`/\`-\`), line numbers, or the extra gutter spaces from \`git diff\` output.
-4. Omit the **Fix** block only when no code fix exists (e.g. a missing-requirement spec finding); then add **Fix:** as a one-line prose instruction instead.
+2. **Current** and **Fix** are required whenever the fix replaces existing code. Copy the current code verbatim from the file — do not paraphrase it. Keep each block to the smallest span that makes the point (usually under 10 lines), never a whole function unless the whole function is the problem.
+3. Copy code with the file's own indentation and nothing else. Never carry over diff markers (\`+\`/\`-\`), line numbers, or the extra gutter spaces from \`git diff\` output. The **Fix** block holds only code, no commentary inside it.
+4. When the fix adds code instead of replacing it (a missing test, a new file), omit **Current** and write \`**Fix:** in \`path/to/target\`:\` followed by the block. When no code fix exists (e.g. a missing-requirement or scope-creep spec finding), omit both blocks and write **Fix:** as a one-line prose instruction.
 5. Never emit an empty **Fix** block. When the fix is a deletion, write \`**Fix:** delete <what>\` as prose, or show the surrounding lines as they read after the deletion.
 6. Tag both blocks with the real language of the file (\`ts\`, \`go\`, \`sql\`, ...). Never use \`suggestion\` or any other pseudo-language as the tag.
 7. Never merge two issues into one finding — one heading per issue.
@@ -389,18 +387,16 @@ Rules:
 
 ## Output format
 
-Provide your findings in a clear, structured format, in this section order: \`## Summary\`, \`## Findings\`, \`## Spec\`, verdict, \`## Human Reviewer Callouts (Non-Blocking)\`.
-1. Start with \`## Summary\`: 2-5 bullets on what the change does and why, grouped by behaviour rather than by file. Use the spec or PR context for the why when supplied. Describe only, no judgement; problems belong in Findings.
-2. Every finding follows the mandatory finding format above.
-3. Findings must reference locations that overlap with the actual diff — don't flag pre-existing code.
-4. Keep line references as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).
-5. Provide an overall verdict: "correct" (no blocking issues) or "needs attention" (has blocking issues).
-6. Ignore trivial style issues unless they obscure meaning or violate documented standards.
-7. Do not generate a full PR fix — the **Fix** blocks stay scoped to the flagged lines.
-8. Give the verdict per axis when a spec was supplied (defects: correct / needs attention; spec: conformant / diverges), and don't pick a single winner across axes.
-9. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
+Use exactly these sections, in this order: \`## Summary\`, \`## Findings\`, \`## Spec\`, \`## Verdict\`, \`## Human Reviewer Callouts (Non-Blocking)\`.
+1. \`## Summary\`: 2-5 bullets on what the change does and why, grouped by behaviour rather than by file. Use the spec or PR context for the why when supplied. Describe only, no judgement; problems belong in Findings.
+2. Keep line references as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).
+3. Ignore trivial style issues unless they obscure meaning or violate documented standards.
+4. Do not generate a full PR fix — the **Fix** blocks stay scoped to the flagged lines.
+5. \`## Verdict\` is exactly these two bullets, each value optionally followed by one short reason:
+   - \`- Defects: correct\` (no [P0] or [P1] finding) or \`- Defects: needs attention\`
+   - \`- Spec: conformant\`, \`- Spec: diverges\`, or \`- Spec: no spec\`
 
-Output all findings the author would fix if they knew about them. If there are no qualifying findings, explicitly state the code looks good. Don't stop at the first finding - list every qualifying issue. Then append the required non-blocking callouts section.`;
+Output all findings the author would fix if they knew about them. If there are no qualifying findings, write "- (none)" under Findings. Don't stop at the first finding - list every qualifying issue.`;
 
 // Files that document how code should be written in this repo, in priority order.
 // The first one found in a directory wins for that filename; all matches are concatenated.
@@ -2132,7 +2128,7 @@ Required sections (in order):
 - What was reviewed (files/paths, changes, and scope)
 
 ## Verdict
-- "correct" or "needs attention"
+Copy the review's Verdict section verbatim.
 
 ## Findings
 Reproduce each finding in the same shape the review used:
@@ -2163,15 +2159,7 @@ Keep the code blocks verbatim from the review; do not drop them.
 - Or "(none)"
 
 ## Human Reviewer Callouts (Non-Blocking)
-Include only applicable callouts (no yes/no lines):
-- **This change adds a database migration:** <files/details>
-- **This change introduces a new dependency:** <package(s)/details>
-- **This change changes a dependency (or the lockfile):** <files/package(s)/details>
-- **This change modifies auth/permission behavior:** <what changed and where>
-- **This change introduces backwards-incompatible public schema/API/contract changes:** <what changed and where>
-- **This change includes irreversible or destructive operations:** <operation and scope>
-
-If none apply, write "- (none)".
+Copy the review's callouts section verbatim, or "- (none)".
 
 These are informational callouts for humans and are not fix items by themselves.
 

@@ -52,7 +52,8 @@ through a model turn.
 ## Report shape
 
 The report opens with `## Summary`: 2-5 bullets on what the change does and why, with no
-judgement. Then come `## Findings`, `## Spec`, the verdict, and the human reviewer callouts.
+judgement. Then come `## Findings`, `## Spec`, `## Verdict` (one line per axis), and the
+human reviewer callouts.
 
 In PR mode the review also gets the PR author, labels, review bodies, and conversation
 comments as context, so it knows the intent and the concerns already raised. This context
@@ -85,9 +86,9 @@ Every finding on either axis has the same labelled parts, so the picker can pars
 the fix turn gets code it can apply directly:
 
 ````markdown
-### [P1] Short imperative title — `path/to/file.ts:42`
+### [P1] What breaks, in plain words — `path/to/file.ts:42`
 
-**Problem:** what breaks and when.
+**Problem:** what breaks, the input or call path that triggers it, and how.
 
 **Current:**
 ```ts
@@ -102,8 +103,9 @@ the fix turn gets code it can apply directly:
 **Impact:** why it matters and in which scenario.
 ````
 
-The Fix block is replaced with a one-line prose instruction when no code fix exists, for
-example a missing requirement or a deletion.
+When the fix adds code instead of replacing it (a missing test), Current is dropped and Fix
+names the target file. When no code fix exists (a missing requirement, a deletion), Fix is a
+one-line prose instruction.
 
 ## Project standards
 
