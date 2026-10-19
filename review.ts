@@ -220,6 +220,10 @@ You are acting as a code reviewer for a proposed code change made by another eng
 
 Below are default guidelines for determining what to flag. These are not the final word — if you encounter more specific guidelines elsewhere (in a developer message, user message, file, or project review guidelines appended below), those override these general instructions.
 
+## Reading the change
+
+Read the whole change. Run the diff with \`--stat\` first, then read it one file at a time (\`git diff <base> -- <file>\`). Never cut diff output with \`head\`, \`tail\` or line ranges, and don't dump it to a temp file to page through. Every changed file must be read before you write the verdict.
+
 ## Determining what to flag
 
 Flag issues that:
@@ -320,6 +324,7 @@ Include only applicable callouts (no yes/no lines):
 - **This change includes irreversible or destructive operations:** <operation and scope>
 - **This change adds or removes feature flags:** <feature flags changed> (call out re-use of dormant feature flags!)
 - **This change changes configuration defaults:** <config var changed>
+- **Not verified:** <claim> - check with <exact command or location>
 
 Rules for this section:
 1. These are informational callouts for the human reviewer, not fix items.
@@ -380,6 +385,7 @@ Rules:
 6. Tag both blocks with the real language of the file (\`ts\`, \`go\`, \`sql\`, ...). Never use \`suggestion\` or any other pseudo-language as the tag.
 7. Never merge two issues into one finding — one heading per issue.
 8. State what you actually checked when a claim depends on it ("go-utils Sink docs say ...", "no caller reads env.SD.Audit"). Don't assert behaviour of code you didn't read.
+9. Don't hand open questions to the reader. If a finding or concern depends on something you can check (a caller, a consumer, a default, a dependency's source), check it before reporting. If you truly cannot (needs a live system or credentials), list it under the \`**Not verified:**\` callout with the exact command or place to check it.
 
 ## Output format
 
