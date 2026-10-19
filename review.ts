@@ -30,6 +30,12 @@
  *   commit messages are fetched via `linear issue describe` / `gh issue view`,
  *   plus the PR description in PR mode. The review then reports a separate Spec
  *   section covering missing requirements, scope creep and wrong implementations.
+ * - In PR mode the author, labels, review bodies and conversation comments are
+ *   appended as context (not spec).
+ *
+ * Report shape:
+ * - The report opens with a `## Summary` of what the change does, then Findings,
+ *   Spec, verdict and Human Reviewer Callouts.
  *
  * Target validation:
  * - Before the turn starts the ref must resolve, the diff must be non-empty and
@@ -377,15 +383,16 @@ Rules:
 
 ## Output format
 
-Provide your findings in a clear, structured format, in this section order: \`## Findings\`, \`## Spec\`, verdict, \`## Human Reviewer Callouts (Non-Blocking)\`.
-1. Every finding follows the mandatory finding format above.
-2. Findings must reference locations that overlap with the actual diff — don't flag pre-existing code.
-3. Keep line references as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).
-4. Provide an overall verdict: "correct" (no blocking issues) or "needs attention" (has blocking issues).
-5. Ignore trivial style issues unless they obscure meaning or violate documented standards.
-6. Do not generate a full PR fix — the **Fix** blocks stay scoped to the flagged lines.
-7. Give the verdict per axis when a spec was supplied (defects: correct / needs attention; spec: conformant / diverges), and don't pick a single winner across axes.
-8. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
+Provide your findings in a clear, structured format, in this section order: \`## Summary\`, \`## Findings\`, \`## Spec\`, verdict, \`## Human Reviewer Callouts (Non-Blocking)\`.
+1. Start with \`## Summary\`: 2-5 bullets on what the change does and why, grouped by behaviour rather than by file. Use the spec or PR context for the why when supplied. Describe only, no judgement; problems belong in Findings.
+2. Every finding follows the mandatory finding format above.
+3. Findings must reference locations that overlap with the actual diff — don't flag pre-existing code.
+4. Keep line references as short as possible (avoid ranges over 5-10 lines; pick the most suitable subrange).
+5. Provide an overall verdict: "correct" (no blocking issues) or "needs attention" (has blocking issues).
+6. Ignore trivial style issues unless they obscure meaning or violate documented standards.
+7. Do not generate a full PR fix — the **Fix** blocks stay scoped to the flagged lines.
+8. Give the verdict per axis when a spec was supplied (defects: correct / needs attention; spec: conformant / diverges), and don't pick a single winner across axes.
+9. End with the required "Human Reviewer Callouts (Non-Blocking)" section and all applicable bold callouts (no yes/no).
 
 Output all findings the author would fix if they knew about them. If there are no qualifying findings, explicitly state the code looks good. Don't stop at the first finding - list every qualifying issue. Then append the required non-blocking callouts section.`;
 
@@ -799,6 +806,34 @@ async function fetchPrDescription(pi: ExtensionAPI, prNumber: number): Promise<S
 		origin: `PR #${prNumber} description`,
 		content: truncateSpec(`# ${data.title ?? `PR #${prNumber}`}\n\n${data.body}`),
 	};
+}
+
+type PrDiscussion = {
+	author: { login: string } | null;
+	labels: { name: string }[];
+	comments: { author: { login: string } | null; body: string }[];
+	reviews: { author: { login: string } | null; state: string; body: string }[];
+};
+
+async function fetchPrDiscussion(pi: ExtensionAPI, prNumber: number): Promise<string | null> {
+	const { stdout, code } = await pi.exec("gh", ["pr", "view", String(prNumber), "--json", "author,labels,comments,reviews"]);
+	if (code !== 0 || !stdout.trim()) return null;
+
+	const data = JSON.parse(stdout) as PrDiscussion;
+	const lines = [`Author: @${data.author?.login ?? "ghost"}`];
+	if (data.labels.length > 0) lines.push(`Labels: ${data.labels.map((l) => l.name).join(", ")}`);
+
+	const entries = [
+		...data.reviews.filter((r) => r.body.trim()).map((r) => `- @${r.author?.login ?? "ghost"} (review, ${r.state}): ${r.body.trim()}`),
+		...data.comments.filter((c) => c.body.trim()).map((c) => `- @${c.author?.login ?? "ghost"}: ${c.body.trim()}`),
+	];
+	if (entries.length > 0) lines.push("", "Conversation:", ...entries);
+
+	return truncateSpec(lines.join("\n"));
+}
+
+function formatPrDiscussionSection(prNumber: number, discussion: string): string {
+	return `Pull request #${prNumber} context (use it to understand intent and concerns already raised; it is not a spec and does not replace reading the diff):\n\n${discussion}`;
 }
 
 /**
@@ -1762,6 +1797,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		}
 
 		const specSources = await collectSpecSources(pi, target);
+		const prDiscussion = target.type === "pullRequest" ? await fetchPrDiscussion(pi, target.prNumber) : null;
 
 		// Handle fresh session mode
 		if (useFreshSession) {
@@ -1837,6 +1873,10 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			fullPrompt += `\n\nThis project documents its own standards. These override the general guidelines above wherever they conflict:\n\n${projectGuidelines}`;
 		}
 
+		if (prDiscussion && target.type === "pullRequest") {
+			fullPrompt += `\n\n${formatPrDiscussionSection(target.prNumber, prDiscussion)}`;
+		}
+
 		if (specSources.length > 0) {
 			fullPrompt += `\n\n${formatSpecSection(specSources)}`;
 		} else {
@@ -1845,7 +1885,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 		const modeHint = useFreshSession ? " (fresh session)" : "";
 		const specHint = specSources.length > 0 ? ` — spec: ${specSources.map((s) => s.origin).join(", ")}` : "";
-		ctx.ui.notify(`Starting review: ${hint}${modeHint}${specHint}`, "info");
+		const prHint = prDiscussion ? " + PR discussion" : "";
+		ctx.ui.notify(`Starting review: ${hint}${modeHint}${specHint}${prHint}`, "info");
 
 		// Send as a user message that triggers a turn
 		pi.sendUserMessage(fullPrompt);

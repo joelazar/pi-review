@@ -49,6 +49,15 @@ Before the turn starts, the target is validated: the ref must resolve, the diff 
 non-empty, and folder paths must exist. A typo fails right away instead of halfway
 through a model turn.
 
+## Report shape
+
+The report opens with `## Summary`: 2-5 bullets on what the change does and why, with no
+judgement. Then come `## Findings`, `## Spec`, the verdict, and the human reviewer callouts.
+
+In PR mode the review also gets the PR author, labels, review bodies, and conversation
+comments as context, so it knows the intent and the concerns already raised. This context
+is not treated as spec and is truncated to 8,000 characters.
+
 ## Two axes
 
 Findings are reported under two headings that stay separate, since one can pass while the
